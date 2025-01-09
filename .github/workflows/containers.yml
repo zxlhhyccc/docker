@@ -20,17 +20,11 @@ on:
         description: "Prefix for the image name (add '-' at the end)"
         required: false
 
-
-  # schedule:
-  #   - cron: "0 5 * * *" # daily snapshot
-  #   - cron: "0 6 * * *" # daily 23.05-SNAPSHOT
-  #   - cron: "0 7 * * 2" # weekly 22.03-SNAPSHOT
-  #   - cron: "0 8 16 * *" # monthly 21.02-SNAPSHOT
-
 jobs:
   generate_matrix:
     name: Set matrix
     runs-on: ubuntu-latest
+
     outputs:
       imagebuilders: ${{ steps.find_targets.outputs.imagebuilders }}
       rootfs: ${{ steps.find_targets.outputs.rootfs }}
@@ -39,30 +33,10 @@ jobs:
       version: ${{ steps.find_targets.outputs.version }}
       version_path: ${{ steps.find_targets.outputs.version_path }}
       file_host: ${{ steps.find_targets.outputs.file_host }}
+      run_setup: ${{ steps.find_targets.outputs.run_setup }}
 
     steps:
-      - name: Set release to 23.05-SNAPSHOT
-        if: github.event.schedule == '0 6 * * *'
-        run: |
-          echo "VERSION=23.05-SNAPSHOT" >> "$GITHUB_ENV"
-          echo "VERSION_PATH=releases/23.05-SNAPSHOT" >> "$GITHUB_ENV"
-          echo "REF=openwrt-23.05" >> "$GITHUB_ENV"
-
-      - name: Set release to 22.03-SNAPSHOT
-        if: github.event.schedule == '0 7 * * 2'
-        run: |
-          echo "VERSION=22.03-SNAPSHOT" >> "$GITHUB_ENV"
-          echo "VERSION_PATH=releases/22.03-SNAPSHOT" >> "$GITHUB_ENV"
-          echo "REF=openwrt-22.03" >> "$GITHUB_ENV"
-
-      - name: Set release to 21.02-SNAPSHOT
-        if: github.event.schedule == '0 8 16 * *'
-        run: |
-          echo "VERSION=21.02-SNAPSHOT" >> "$GITHUB_ENV"
-          echo "VERSION_PATH=releases/21.02-SNAPSHOT" >> "$GITHUB_ENV"
-          echo "REF=openwrt-21.02" >> "$GITHUB_ENV"
-
-      - name: Set release manually
+      - name: Set release
         if: github.event.inputs.ref != ''
         run: |
           export REF=${{ github.event.inputs.ref == 'master' && 'main' || github.event.inputs.ref }}
@@ -80,6 +54,7 @@ jobs:
             v*)
               VERSION=${REF//v/}
               echo "VERSION_PATH=releases/$VERSION" >> "$GITHUB_ENV"
+              echo "RUN_SETUP=1" >> "$GITHUB_ENV"
             ;;
             *)
               echo "No tag or branch found"
@@ -125,7 +100,7 @@ jobs:
               ;;
             esac
 
-          done <<< $(perl ./scripts/dump-target-info.pl targets 2>/dev/null | grep "$TARGET_FILTER")
+          done <<< $(perl ./scripts/dump-target-info.pl targets 2>/dev/null | ([[ -n "$TARGET_FILTER" ]] && grep -w "$TARGET_FILTER" || cat))
 
           JSON_IB='{"include":'"$JSON_IB"']}'
           echo -e "\n---- imagebuilders ----\n"
@@ -153,7 +128,7 @@ jobs:
             FIRST=0
 
             JSON="$JSON"'{"arch":"'"$ARCH"'","target":"'"$TARGET"'","tags":"'"$ARCH"'\n'"$TARGETS"'"}'
-          done <<< $(perl ./scripts/dump-target-info.pl architectures 2>/dev/null | grep "$TARGET_FILTER")
+          done <<< $(perl ./scripts/dump-target-info.pl architectures 2>/dev/null | ([[ -n "$TARGET_FILTER" ]] && grep -w "$TARGET_FILTER" || cat))
 
           JSON='{"include":'"$JSON"']}'
           echo -e "\n---- sdks ----\n"
@@ -164,6 +139,7 @@ jobs:
           echo "ref=${REF:-main}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION:-SNAPSHOT}" >> "$GITHUB_OUTPUT"
           echo "version_path=${VERSION_PATH:-snapshots}" >> "$GITHUB_OUTPUT"
+          echo "run_setup=${RUN_SETUP:-0}" >> "$GITHUB_OUTPUT"
 
           FILE_HOST=${{ needs.generate_matrix.outputs.file_host }}
           echo "file_host=${FILE_HOST:-mirror-03.infra.openwrt.org}" >> "$GITHUB_OUTPUT"
@@ -221,6 +197,7 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
+          no-cache: true
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -229,6 +206,10 @@ jobs:
             VERSION_PATH=${{ needs.generate_matrix.outputs.version_path }}
             TARGET=${{ matrix.target }}
             FILE_HOST=${{ needs.generate_matrix.outputs.file_host }}
+            RUN_SETUP=${{ needs.generate_matrix.outputs.run_setup }}
+
+      - name: Cleanup Docker containers
+        run: docker system prune -f
 
   push-sdk-container:
     name: SDK
@@ -333,6 +314,7 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
+          no-cache: true
           push: ${{ github.event_name != 'pull_request' }}
           tags: |
             ${{ steps.meta_ref.outputs.tags }}
@@ -345,7 +327,11 @@ jobs:
             VERSION_PATH=${{ needs.generate_matrix.outputs.version_path }}
             TARGET=${{ matrix.target }}
             FILE_HOST=${{ needs.generate_matrix.outputs.file_host }}
+            RUN_SETUP=${{ needs.generate_matrix.outputs.run_setup }}
           labels: ${{ steps.meta_ref.outputs.labels }}
+
+      - name: Cleanup Docker containers
+        run: docker system prune -f
 
   push-rootfs-container:
     name: RootFS
@@ -358,6 +344,7 @@ jobs:
 
     steps:
       - name: Set up QEMU
+        if: github.event_name == 'pull_request'
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-user-static binfmt-support
@@ -423,12 +410,14 @@ jobs:
             BASE_IMAGE=scratch
             CMD=ash
             FILE_HOST=${{ needs.generate_matrix.outputs.file_host }}
+            RUN_SETUP=${{ needs.generate_matrix.outputs.run_setup }}
           EOF' >> $GITHUB_OUTPUT
 
       - name: Build
         id: build
         uses: docker/build-push-action@v6
         with:
+          no-cache: true
           push: false
           tags: ${{ steps.meta.outputs.tags }}
           load: true
@@ -443,8 +432,12 @@ jobs:
         if: github.event_name != 'pull_request'
         uses: docker/build-push-action@v6
         with:
+          no-cache: true
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           build-args: ${{ steps.build_args.outputs.args }}
           labels: ${{ steps.meta.outputs.labels }}
           platforms: linux/${{ matrix.arch }}
+
+      - name: Cleanup Docker containers
+        run: docker system prune -f
